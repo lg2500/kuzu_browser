@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.DS_Store
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.superpowers/
+.claude/
+*.db
+*.db.lock
+kuzu_data/

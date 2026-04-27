@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>body { margin: 0; padding: 0; display: none; }</style>
+</head>
+<body>
+  <script>
+    function sendMessageToStreamlitClient(type, data) {
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: type,
+        ...data
+      }, "*");
+    }
+    window.addEventListener("message", function(event) {
+      if (event.data.type === "streamlit:render") {
+         sendMessageToStreamlitClient("streamlit:setFrameHeight", {height: 0});
+      }
+      if (typeof event.data.kuzu_click !== 'undefined') {
+         // Received a broadcast from pyvis iframe!
+         sendMessageToStreamlitClient("streamlit:setComponentValue", {value: event.data.kuzu_click, dataType: "json"});
+      }
+    });
+    sendMessageToStreamlitClient("streamlit:componentReady", {apiVersion: 1});
+  </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# 若默认源连接 files.pythonhosted.org 超时，建议用镜像 + 长超时（任选其一镜像）：
+#   pip install -r requirements.txt \
+#     --default-timeout=600 --retries=15 \
+#     -i https://mirrors.aliyun.com/pypi/simple/ \
+#     --trusted-host mirrors.aliyun.com
+# 运行应用请用（在项目根目录；避免 PATH 未含 Scripts/bin）：
+#   python -m streamlit run main.py
+
+kuzu>=0.6.0
+streamlit>=1.28.0
+pyvis>=0.3.2
+pandas>=2.0.0
+openai>=1.0.0
