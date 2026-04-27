@@ -4,6 +4,17 @@ A lightweight graph database browser built with **Streamlit** + **Kùzu** + **Py
 
 Upload a Kùzu database (or connect to a local path), then explore, query, and edit your graph — all from the browser.
 
+## Screenshots
+
+### Connect to your database
+![Home](image/index.png)
+
+### Write Cypher or let AI generate it for you
+![Query](image/query.png)
+
+### Explore your graph visually
+![Graph](image/graph.png)
+
 ## Features
 
 - **Query** — Write Cypher or describe what you want in natural language (LLM-powered). Results render as interactive force-directed graphs.
