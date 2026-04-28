@@ -17,6 +17,7 @@ from db import (
     build_mock_graph_write_cypher,
     build_mock_graph_delete_cypher,
     build_create_edge_only_cypher,
+    build_update_edge_cypher,
     build_schema_diagram_graph,
     ensure_limit_clause,
     execute_to_dataframe,
@@ -475,16 +476,16 @@ def render_mock_view(
             st.session_state.pop("_edit_graph_cache_html", None)
             st.rerun()
 
-    def _write_and_patch(cy: str):
-        """执行写入，成功返回 True（不刷新图，由调用方局部更新 session state）。"""
-        exec_results, _ct = execute_write_statements_tracked(conn, cy)
+    def _write_and_patch(cy: str, params: Optional[Dict[str, Any]] = None):
+        """执行写入，成功返回 True。"""
+        exec_results, _ct = execute_write_statements_tracked(conn, cy, params)
         bad = [(s, e) for s, ok, e in exec_results if not ok]
         if bad:
             for s, msg in bad:
                 st.error(f"{msg}\n\n```\n{s[:200]}\n```")
             return False
         try:
-            conn.execute("CHECKPOINT;")
+            conn.execute("CHECKPOINT")
         except Exception:
             pass
         return True
@@ -534,10 +535,10 @@ def render_mock_view(
                             new_props[fn] = st.text_input(f"Label for {fn}", value=val0, key=f"nn_{fn}", placeholder=ph, label_visibility="collapsed")
                         
                         if st.form_submit_button("🌟 保存入库", type="primary"):
-                            cy, err = build_mock_graph_write_cypher([{"id": "new", "table": new_tbl, "props": new_props}], [], npk, rpk, rel_endpoints, ntypes, rtypes)
+                            cy, params, err = build_mock_graph_write_cypher([{"id": "new", "table": new_tbl, "props": new_props}], [], npk, rpk, rel_endpoints, ntypes, rtypes)
                             if err:
                                 st.error(err)
-                            elif cy and _write_and_patch(cy):
+                            elif cy and _write_and_patch(cy, params):
                                 import uuid as _uuid
                                 nid = f"new_{_uuid.uuid4().hex[:8]}"
                                 st.session_state.db_graph_nodes.append({"id": nid, "table": new_tbl, "props": new_props})
@@ -574,22 +575,22 @@ def render_mock_view(
                         edit_props[fn] = st.text_input(f"Label for {fn}", value=props.get(fn, ""), key=f"en_{_sel_id}_{fn}", label_visibility="collapsed")
                     
                     if st.form_submit_button("🚀 更新", type="primary"):
-                        cy, err = build_mock_graph_write_cypher([{"id": _sel_id, "table": tbl, "props": edit_props}], [], npk, rpk, rel_endpoints, ntypes, rtypes)
+                        cy, params, err = build_mock_graph_write_cypher([{"id": _sel_id, "table": tbl, "props": edit_props}], [], npk, rpk, rel_endpoints, ntypes, rtypes)
                         if err:
                             st.error(err)
-                        elif cy and _write_and_patch(cy):
+                        elif cy and _write_and_patch(cy, params):
                             node["props"] = edit_props
-                            pk_fields = npk.get(tbl, set())
-                            label = next((edit_props[f] for f in pk_fields if edit_props.get(f)), tbl)
+                            name_val = edit_props.get("name", "").strip()
+                            label = name_val[:42] if name_val else tbl
                             _send_graph_cmd('{kuzu_cmd:"update_node",node_id:"' + str(_sel_id) + '",label:"' + label.replace('"', '\\"') + '"}')
                             st.success("节点已更新！")
 
                 st.markdown('<div style="margin-top: 12px;">', unsafe_allow_html=True)
                 if st.button("🗑️ 抛弃该节点", type="secondary", use_container_width=True):
-                    cy, err = build_mock_graph_delete_cypher([{"id": _sel_id, "table": tbl, "props": props}], [], npk, rpk, rel_endpoints, ntypes, rtypes)
+                    cy, params, err = build_mock_graph_delete_cypher([{"id": _sel_id, "table": tbl, "props": props}], [], npk, rpk, rel_endpoints, ntypes, rtypes)
                     if err:
                         st.error(err)
-                    elif cy and _write_and_patch(cy):
+                    elif cy and _write_and_patch(cy, params):
                         st.session_state.db_graph_nodes = [n for n in st.session_state.db_graph_nodes if str(n["id"]) != str(_sel_id)]
                         st.session_state.db_graph_edges = [e for e in st.session_state.db_graph_edges if str(e["src"]) != str(_sel_id) and str(e["dst"]) != str(_sel_id)]
                         _send_graph_cmd('{kuzu_cmd:"remove_node",node_id:"' + str(_sel_id) + '"}')
@@ -626,11 +627,14 @@ def render_mock_view(
                         src_node = next((n for n in nodes_list if str(n["id"]) == str(edge["src"])), None)
                         dst_node = next((n for n in nodes_list if str(n["id"]) == str(edge["dst"])), None)
                         if src_node and dst_node:
-                            cy, err = build_create_edge_only_cypher(src_node, dst_node, edge_data, npk, rel_endpoints, ntypes, rtypes)
+                            cy, params, err = build_update_edge_cypher(src_node, dst_node, edge_data, npk, rel_endpoints, ntypes, rtypes)
                             if err:
                                 st.error(err)
-                            elif cy and _write_and_patch(cy):
+                            elif cy and _write_and_patch(cy, params):
                                 edge["props"] = edit_props
+                                new_label = edit_props.get("name", "").strip()[:42] if edit_props.get("name", "").strip() else rt
+                                tip = "\\n".join(f"{k}: {v}" for k, v in edit_props.items())
+                                _send_graph_cmd('{kuzu_cmd:"update_edge",edge_id:"' + str(_sel_id) + '",label:"' + new_label.replace('"', '\\"') + '",title:"' + tip.replace('"', '\\"') + '"}')
                                 st.success("关系已更新！")
                         else:
                             st.error("无法构建完整写入：找不到关系两端的完整节点上下文信息。")
@@ -641,10 +645,10 @@ def render_mock_view(
                     dst_node = next((n for n in nodes_list if str(n["id"]) == str(edge["dst"])), None)
                     if src_node and dst_node:
                         edge_data = {"id": _sel_id, "rel": rt, "src": edge["src"], "dst": edge["dst"], "props": props, "_src_props": src_node["props"], "_dst_props": dst_node["props"]}
-                        cy, err = build_mock_graph_delete_cypher([], [edge_data], npk, rpk, rel_endpoints, ntypes, rtypes)
+                        cy, params, err = build_mock_graph_delete_cypher([], [edge_data], npk, rpk, rel_endpoints, ntypes, rtypes)
                         if err:
                             st.error(err)
-                        elif cy and _write_and_patch(cy):
+                        elif cy and _write_and_patch(cy, params):
                             st.session_state.db_graph_edges = [e for e in st.session_state.db_graph_edges if str(e["id"]) != str(_sel_id)]
                             _send_graph_cmd('{kuzu_cmd:"remove_edge",edge_id:"' + str(_sel_id) + '"}')
                             st.success("连线已删除！")
@@ -684,10 +688,10 @@ def render_mock_view(
                                 st.error(f"必填主键字段不能为空：{', '.join(missing_pks)}")
                             else:
                                 edge_data = {"id": "new", "rel": new_rt, "src": _sel_id, "dst": _sel_dst, "props": new_props}
-                                cy, err = build_create_edge_only_cypher(src_node, dst_node, edge_data, npk, rel_endpoints, ntypes, rtypes)
+                                cy, params, err = build_create_edge_only_cypher(src_node, dst_node, edge_data, npk, rel_endpoints, ntypes, rtypes)
                                 if err:
                                     st.error(err)
-                                elif cy and _write_and_patch(cy):
+                                elif cy and _write_and_patch(cy, params):
                                     new_edge = {"id": f"new_{_sel_id}_{_sel_dst}", "rel": new_rt, "src": _sel_id, "dst": _sel_dst, "props": new_props}
                                     st.session_state.db_graph_edges.append(new_edge)
                                     st.session_state.pop("_edit_graph_cache_html", None)

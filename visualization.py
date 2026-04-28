@@ -600,6 +600,14 @@ def _inject_explorer_panel_and_click_handler(
           if (cmd === "update_node" && ev.data.node_id && ev.data.label) {{
             try {{ nds.update({{id: ev.data.node_id, label: ev.data.label}}); }} catch(e) {{}}
           }}
+          if (cmd === "update_edge" && ev.data.edge_id) {{
+            try {{
+              var upd = {{id: ev.data.edge_id}};
+              if (ev.data.label) upd.label = ev.data.label;
+              if (ev.data.title) upd.title = ev.data.title;
+              eds.update(upd);
+            }} catch(e) {{}}
+          }}
         }});
       }})();
     """

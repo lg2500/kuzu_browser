@@ -394,27 +394,32 @@ def rollback_created_tables(conn: Any, created_tables: List[Tuple[str, str]]) ->
 
 
 def execute_write_statements_tracked(
-    conn: Any, cypher_text: str
+    conn: Any, cypher_text: str, params: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[Tuple[str, bool, Optional[str]]], List[Tuple[str, str]]]:
     """
-    执行多条写语句（DDL + DML），并追踪本次新建的表（用于失败时回滚）。
-    返回:
-        results: [(statement, success, error_msg), ...]
-        created_tables: [(table_type, table_name), ...]  本次成功 CREATE TABLE 的列表
+    执行写语句（DDL + DML），并追踪本次新建的表（用于失败时回滚）。
+    当 params 非空时，直接参数化执行单条语句；否则按分号拆分逐条执行。
     """
     import re as _re
 
-    raw_stmts = [s.strip() for s in cypher_text.split(";")]
-    statements = [s for s in raw_stmts if s]
-
     results: List[Tuple[str, bool, Optional[str]]] = []
     created_tables: List[Tuple[str, str]] = []
+
+    if params is not None:
+        try:
+            conn.execute(cypher_text, params)
+            results.append((cypher_text, True, None))
+        except Exception as exc:  # noqa: BLE001
+            results.append((cypher_text, False, str(exc)))
+        return results, created_tables
+
+    raw_stmts = [s.strip() for s in cypher_text.split(";")]
+    statements = [s for s in raw_stmts if s]
 
     for stmt in statements:
         try:
             conn.execute(stmt)
             results.append((stmt, True, None))
-            # 检测是否为 CREATE NODE/REL TABLE
             m_node = _re.match(r"(?i)CREATE\s+NODE\s+TABLE\s+`?(\w+)`?", stmt.strip())
             m_rel = _re.match(r"(?i)CREATE\s+REL\s+TABLE\s+`?(\w+)`?", stmt.strip())
             if m_node:
@@ -591,6 +596,40 @@ def format_cypher_literal_from_text(
             return None
         return _cypher_string_list_literal(elems)
 
+    ht = type_hint.upper().strip() if type_hint else ""
+
+    if ht == "STRING":
+        esc = s.replace("\\", "\\\\").replace("'", "\\'")
+        return f"'{esc}'"
+    if ht in ("BOOL", "BOOLEAN"):
+        low = s.lower()
+        if low in ("true", "1"):
+            return "true"
+        if low in ("false", "0"):
+            return "false"
+        return None
+    if ht in ("INT64", "INT32", "INT16", "INT8", "UINT64", "UINT32", "UINT16", "UINT8", "SERIAL"):
+        try:
+            return str(int(s))
+        except ValueError:
+            return None
+    if ht in ("DOUBLE", "FLOAT"):
+        try:
+            f = float(s)
+            return repr(f) if math.isfinite(f) else None
+        except ValueError:
+            return None
+    if ht == "DATE":
+        esc = s.replace("\\", "\\\\").replace("'", "\\'")
+        return f"date('{esc}')"
+    if ht == "TIMESTAMP":
+        esc = s.replace("\\", "\\\\").replace("'", "\\'")
+        return f"timestamp('{esc}')"
+    if ht == "UUID":
+        esc = s.replace("\\", "\\\\").replace("'", "\\'")
+        return f"UUID('{esc}')"
+
+    # 无 type_hint 时回退到猜测
     low = s.lower()
     if low in ("true", "false"):
         return low
@@ -629,6 +668,120 @@ def _props_map_to_cypher_inner(
     return ", ".join(parts)
 
 
+def _convert_value_for_param(raw: Optional[str], type_hint: Optional[str] = None) -> Any:
+    """将表单字符串转为 Python 原生类型，供 Kùzu 参数化查询使用。空白返回 None。"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    list_base = _kuzu_list_element_base_type(type_hint)
+    if list_base:
+        if list_base == "STRING":
+            return _parse_user_string_list(s) or None
+        if list_base in ("INT64", "INT32", "INT16", "INT8", "UINT64", "UINT32", "UINT16", "UINT8"):
+            try:
+                return _parse_user_int_list(s) or None
+            except ValueError:
+                return None
+        if list_base in ("DOUBLE", "FLOAT"):
+            if s.startswith("["):
+                try:
+                    val = json.loads(s)
+                    if isinstance(val, list):
+                        return [float(x) for x in val]
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    return None
+            try:
+                f = float(s)
+                return [f] if math.isfinite(f) else None
+            except ValueError:
+                return None
+        return _parse_user_string_list(s) or None
+
+    ht = type_hint.upper().strip() if type_hint else ""
+    if ht == "STRING":
+        return s
+    if ht in ("BOOL", "BOOLEAN"):
+        low = s.lower()
+        if low in ("true", "1"):
+            return True
+        if low in ("false", "0"):
+            return False
+        return None
+    if ht in ("INT64", "INT32", "INT16", "INT8", "UINT64", "UINT32", "UINT16", "UINT8", "SERIAL"):
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    if ht in ("DOUBLE", "FLOAT"):
+        try:
+            f = float(s)
+            return f if math.isfinite(f) else None
+        except ValueError:
+            return None
+    if ht in ("DATE", "TIMESTAMP", "UUID"):
+        return s
+
+    # 无 type_hint：猜测
+    low = s.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        if "." in s:
+            f = float(s)
+            return f if math.isfinite(f) else s
+        return int(s)
+    except ValueError:
+        return s
+
+
+def _props_to_where_params(
+    var: str, props: Dict[str, Any],
+    field_types: Optional[Dict[str, str]] = None,
+    prefix: str = "w",
+) -> Tuple[str, Dict[str, Any]]:
+    """生成 WHERE string(var.`field`) = $param 条件和参数 dict。
+    用 string() 包装以绕过 Kùzu 对 id 等保留字的字段访问冲突。"""
+    field_types = field_types or {}
+    conds: List[str] = []
+    params: Dict[str, Any] = {}
+    for k, v in props.items():
+        hint = field_types.get(str(k))
+        pval = _convert_value_for_param(v if isinstance(v, str) else str(v), hint)
+        if pval is None:
+            continue
+        ek = _escape_cypher_ident(str(k))
+        pname = f"{prefix}_{k}"
+        conds.append(f"string({var}.`{ek}`) = ${pname}")
+        params[pname] = str(pval)
+    return " AND ".join(conds), params
+
+
+def _props_to_set_params(
+    var: str, props: Dict[str, Any],
+    field_types: Optional[Dict[str, str]] = None,
+    prefix: str = "s",
+) -> Tuple[str, Dict[str, Any]]:
+    """生成 SET var.field = $param 部分和参数 dict。"""
+    field_types = field_types or {}
+    parts: List[str] = []
+    params: Dict[str, Any] = {}
+    for k, v in props.items():
+        hint = field_types.get(str(k))
+        pval = _convert_value_for_param(v if isinstance(v, str) else str(v), hint)
+        if pval is None:
+            continue
+        ek = _escape_cypher_ident(str(k))
+        pname = f"{prefix}_{k}"
+        parts.append(f"{var}.`{ek}` = ${pname}")
+        params[pname] = pval
+    return ", ".join(parts), params
+
+
 def _validate_pks(
     props: Dict[str, Any],
     pk_names: Set[str],
@@ -655,19 +808,17 @@ def build_mock_graph_write_cypher(
     rel_field_types: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Tuple[str, Optional[str]]:
     """
-    由 Mock 画布的草稿节点 / 边生成 Kùzu 写库 Cypher（多条语句以分号分隔）。
-    draft_nodes: [{"id", "table", "props": {str: str}}]
-    draft_edges: [{"id", "rel", "src", "dst", "props": {str: str}}]
-    node_field_types / rel_field_types: 表名 -> {属性名: TABLE_INFO 类型}，用于 STRING[] 等。
+    由 Mock 画布的草稿节点 / 边生成 Kùzu 写库 Cypher。
+    返回 (cypher, params_dict_or_None, error)。
+    当有主键时使用参数化查询（单条 MATCH...SET）；无主键时用字符串拼接 CREATE。
     """
     if not draft_nodes and not draft_edges:
-        return "", "画布是空的，请先添加节点。"
+        return "", None, "画布是空的，请先添加节点。"
 
     node_field_types = node_field_types or {}
     rel_field_types = rel_field_types or {}
 
     by_id = {str(n["id"]): n for n in draft_nodes}
-    stmts: List[str] = []
 
     for node in draft_nodes:
         t = str(node["table"])
@@ -677,84 +828,27 @@ def build_mock_graph_write_cypher(
             props, node_pk_map.get(t, set()), f"节点 `{t}`（{node['id']}）", nft
         )
         if err:
-            return "", err
-        inner = _props_map_to_cypher_inner(props, nft)
-        if not inner:
-            return "", f"节点 `{t}`（{node['id']}）没有可写入的非空属性。"
+            return "", None, err
         lab = _escape_cypher_ident(t)
         pks = node_pk_map.get(t, set())
         if pks:
-            pk_inner = _props_map_to_cypher_inner(
-                {k: v for k, v in props.items() if k in pks}, nft
-            )
-            set_parts = []
-            for k, v in props.items():
-                if k not in pks:
-                    v_lit = format_cypher_literal_from_text(v, nft.get(k))
-                    if v_lit is not None:
-                        set_parts.append(f"n.`{_escape_cypher_ident(k)}` = {v_lit}")
-            if set_parts:
-                stmts.append(f"MERGE (n:`{lab}` {{{pk_inner}}}) SET " + ", ".join(set_parts))
-            else:
-                stmts.append(f"MERGE (n:`{lab}` {{{pk_inner}}})")
+            pk_props = {k: v for k, v in props.items() if k in pks}
+            non_pk_props = {k: v for k, v in props.items() if k not in pks}
+            where_clause, w_params = _props_to_where_params("n", pk_props, nft, "w")
+            set_clause, s_params = _props_to_set_params("n", non_pk_props, nft, "s")
+            if not set_clause:
+                return "", None, f"节点 `{t}` 没有可更新的非主键属性（主键不可修改）。"
+            params = {**w_params, **s_params}
+            stmt = f"MATCH (n:`{lab}`) WHERE {where_clause} SET {set_clause}"
+            return stmt, params, None
         else:
-            stmts.append(f"CREATE (n:`{lab}` {{{inner}}})")
+            inner = _props_map_to_cypher_inner(props, nft)
+            if not inner:
+                return "", None, f"节点 `{t}`（{node['id']}）没有可写入的非空属性。"
+            stmt = f"CREATE (n:`{lab}` {{{inner}}})"
+            return stmt, None, None
 
-    for edge in draft_edges:
-        rel = str(edge["rel"])
-        sid = str(edge["src"])
-        did = str(edge["dst"])
-        src_n = by_id.get(sid)
-        dst_n = by_id.get(did)
-        if not src_n or not dst_n:
-            return "", f"星桥 `{edge.get('id')}` 的端点节点已丢失，请重新连接或删除该关系。"
-        if rel not in rel_endpoints:
-            return "", f"未知关系类型 `{rel}`。"
-        exp_src, exp_dst = rel_endpoints[rel]
-        if str(src_n["table"]) != exp_src or str(dst_n["table"]) != exp_dst:
-            return (
-                "",
-                f"关系 `{rel}` 要求从 `{exp_src}` 指向 `{exp_dst}`，"
-                f"当前为 `{src_n['table']}` → `{dst_n['table']}`。",
-            )
-        spe = dict(src_n.get("props") or {})
-        dpe = dict(dst_n.get("props") or {})
-        nft_s = node_field_types.get(exp_src, {})
-        nft_d = node_field_types.get(exp_dst, {})
-        err = _validate_pks(
-            spe, node_pk_map.get(exp_src, set()), f"起点节点（{sid}）", nft_s
-        )
-        if err:
-            return "", err
-        err = _validate_pks(
-            dpe, node_pk_map.get(exp_dst, set()), f"终点节点（{did}）", nft_d
-        )
-        if err:
-            return "", err
-        si = _props_map_to_cypher_inner(spe, nft_s)
-        di = _props_map_to_cypher_inner(dpe, nft_d)
-        rprops = dict(edge.get("props") or {})
-        rft = rel_field_types.get(rel, {})
-        err = _validate_pks(
-            rprops, rel_pk_map.get(rel, set()), f"关系 `{rel}`（{edge.get('id')}）", rft
-        )
-        if err:
-            return "", err
-        ri = _props_map_to_cypher_inner(rprops, rft)
-        rlab = _escape_cypher_ident(rel)
-        sla = _escape_cypher_ident(exp_src)
-        dla = _escape_cypher_ident(exp_dst)
-        if ri:
-            stmts.append(
-                f"MATCH (a:`{sla}` {{{si}}}), (b:`{dla}` {{{di}}}) "
-                f"CREATE (a)-[:`{rlab}` {{{ri}}}]->(b)"
-            )
-        else:
-            stmts.append(
-                f"MATCH (a:`{sla}` {{{si}}}), (b:`{dla}` {{{di}}}) CREATE (a)-[:`{rlab}`]->(b)"
-            )
-
-    return ";\n".join(stmts) + (";" if stmts else ""), None
+    return "", None, None
 
 
 def build_create_edge_only_cypher(
@@ -765,19 +859,19 @@ def build_create_edge_only_cypher(
     rel_endpoints: Dict[str, Tuple[str, str]],
     node_field_types: Optional[Dict[str, Dict[str, str]]] = None,
     rel_field_types: Optional[Dict[str, Dict[str, str]]] = None,
-) -> Tuple[str, Optional[str]]:
-    """Only MATCH existing nodes and CREATE the edge — never MERGE/CREATE nodes."""
+) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """MATCH existing nodes by PK (parameterized) and CREATE the edge."""
     node_field_types = node_field_types or {}
     rel_field_types = rel_field_types or {}
 
     rel = str(edge["rel"])
     if rel not in rel_endpoints:
-        return "", f"未知关系类型 `{rel}`。"
+        return "", None, f"未知关系类型 `{rel}`。"
     exp_src, exp_dst = rel_endpoints[rel]
     st_name = str(src_node["table"])
     dt_name = str(dst_node["table"])
     if st_name != exp_src or dt_name != exp_dst:
-        return "", f"关系 `{rel}` 要求 `{exp_src}` → `{exp_dst}`，当前为 `{st_name}` → `{dt_name}`。"
+        return "", None, f"关系 `{rel}` 要求 `{exp_src}` → `{exp_dst}`，当前为 `{st_name}` → `{dt_name}`。"
 
     spe = dict(src_node.get("props") or {})
     dpe = dict(dst_node.get("props") or {})
@@ -786,10 +880,10 @@ def build_create_edge_only_cypher(
 
     src_pks = node_pk_map.get(exp_src, set())
     dst_pks = node_pk_map.get(exp_dst, set())
-    si = _props_map_to_cypher_inner({k: v for k, v in spe.items() if k in src_pks}, nft_s) if src_pks else _props_map_to_cypher_inner(spe, nft_s)
-    di = _props_map_to_cypher_inner({k: v for k, v in dpe.items() if k in dst_pks}, nft_d) if dst_pks else _props_map_to_cypher_inner(dpe, nft_d)
-    if not si or not di:
-        return "", "无法定位端点节点（主键为空）。"
+    sw, sp = _props_to_where_params("a", {k: v for k, v in spe.items() if k in src_pks} if src_pks else spe, nft_s, "sa")
+    dw, dp = _props_to_where_params("b", {k: v for k, v in dpe.items() if k in dst_pks} if dst_pks else dpe, nft_d, "da")
+    if not sw or not dw:
+        return "", None, "无法定位端点节点（主键为空）。"
 
     rprops = dict(edge.get("props") or {})
     rft = rel_field_types.get(rel, {})
@@ -797,11 +891,63 @@ def build_create_edge_only_cypher(
     sla = _escape_cypher_ident(exp_src)
     dla = _escape_cypher_ident(exp_dst)
     rlab = _escape_cypher_ident(rel)
+    where_clause = sw + " AND " + dw
+    params = {**sp, **dp}
     if ri:
-        stmt = f"MATCH (a:`{sla}` {{{si}}}), (b:`{dla}` {{{di}}}) CREATE (a)-[:`{rlab}` {{{ri}}}]->(b);"
+        stmt = f"MATCH (a:`{sla}`), (b:`{dla}`) WHERE {where_clause} CREATE (a)-[:`{rlab}` {{{ri}}}]->(b)"
     else:
-        stmt = f"MATCH (a:`{sla}` {{{si}}}), (b:`{dla}` {{{di}}}) CREATE (a)-[:`{rlab}`]->(b);"
-    return stmt, None
+        stmt = f"MATCH (a:`{sla}`), (b:`{dla}`) WHERE {where_clause} CREATE (a)-[:`{rlab}`]->(b)"
+    return stmt, params, None
+
+
+def build_update_edge_cypher(
+    src_node: Dict[str, Any],
+    dst_node: Dict[str, Any],
+    edge: Dict[str, Any],
+    node_pk_map: Dict[str, Set[str]],
+    rel_endpoints: Dict[str, Tuple[str, str]],
+    node_field_types: Optional[Dict[str, Dict[str, str]]] = None,
+    rel_field_types: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """MATCH existing edge by endpoints (parameterized) and SET properties."""
+    node_field_types = node_field_types or {}
+    rel_field_types = rel_field_types or {}
+
+    rel = str(edge["rel"])
+    if rel not in rel_endpoints:
+        return "", None, f"未知关系类型 `{rel}`。"
+    exp_src, exp_dst = rel_endpoints[rel]
+    st_name = str(src_node["table"])
+    dt_name = str(dst_node["table"])
+    if st_name != exp_src or dt_name != exp_dst:
+        return "", None, f"关系 `{rel}` 要求 `{exp_src}` → `{exp_dst}`，当前为 `{st_name}` → `{dt_name}`。"
+
+    spe = dict(src_node.get("props") or {})
+    dpe = dict(dst_node.get("props") or {})
+    nft_s = node_field_types.get(exp_src, {})
+    nft_d = node_field_types.get(exp_dst, {})
+
+    src_pks = node_pk_map.get(exp_src, set())
+    dst_pks = node_pk_map.get(exp_dst, set())
+    sw, sp = _props_to_where_params("a", {k: v for k, v in spe.items() if k in src_pks} if src_pks else spe, nft_s, "sa")
+    dw, dp = _props_to_where_params("b", {k: v for k, v in dpe.items() if k in dst_pks} if dst_pks else dpe, nft_d, "da")
+    if not sw or not dw:
+        return "", None, "无法定位端点节点（主键为空）。"
+
+    rprops = dict(edge.get("props") or {})
+    rft = rel_field_types.get(rel, {})
+    sla = _escape_cypher_ident(exp_src)
+    dla = _escape_cypher_ident(exp_dst)
+    rlab = _escape_cypher_ident(rel)
+
+    set_clause, set_params = _props_to_set_params("r", rprops, rft, "rs")
+    if not set_clause:
+        return "", None, "该关系没有可更新的属性。"
+
+    params = {**sp, **dp, **set_params}
+    where_clause = sw + " AND " + dw
+    stmt = f"MATCH (a:`{sla}`)-[r:`{rlab}`]->(b:`{dla}`) WHERE {where_clause} SET {set_clause}"
+    return stmt, params, None
 
 
 def build_mock_graph_delete_cypher(
@@ -812,66 +958,66 @@ def build_mock_graph_delete_cypher(
     rel_endpoints: Dict[str, Tuple[str, str]],
     node_field_types: Optional[Dict[str, Dict[str, str]]] = None,
     rel_field_types: Optional[Dict[str, Dict[str, str]]] = None,
-) -> Tuple[str, Optional[str]]:
-    """生成用于删除指定的节点或关系的 Cypher 语句。"""
+) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """生成用于删除指定的节点或关系的参数化 Cypher 语句（单条）。"""
     node_field_types = node_field_types or {}
     rel_field_types = rel_field_types or {}
-    stmts: List[str] = []
+    all_params: Dict[str, Any] = {}
 
     for edge in draft_edges:
         rel = str(edge["rel"])
-        sid = str(edge["src"])
-        did = str(edge["dst"])
         if rel not in rel_endpoints:
-            return "", f"未知关系类型 `{rel}`。"
+            return "", None, f"未知关系类型 `{rel}`。"
         exp_src, exp_dst = rel_endpoints[rel]
-        
-        # 匹配端点
+
         nft_s = node_field_types.get(exp_src, {})
         nft_d = node_field_types.get(exp_dst, {})
         spe = dict(edge.get("_src_props") or {})
         dpe = dict(edge.get("_dst_props") or {})
-        
-        err = _validate_pks(spe, node_pk_map.get(exp_src, set()), f"起点节点", nft_s)
-        if err: return "", err
-        err = _validate_pks(dpe, node_pk_map.get(exp_dst, set()), f"终点节点", nft_d)
-        if err: return "", err
-        
-        si = _props_map_to_cypher_inner({k:v for k,v in spe.items() if k in node_pk_map.get(exp_src, set())}, nft_s)
-        di = _props_map_to_cypher_inner({k:v for k,v in dpe.items() if k in node_pk_map.get(exp_dst, set())}, nft_d)
-        
+
+        err = _validate_pks(spe, node_pk_map.get(exp_src, set()), "起点节点", nft_s)
+        if err: return "", None, err
+        err = _validate_pks(dpe, node_pk_map.get(exp_dst, set()), "终点节点", nft_d)
+        if err: return "", None, err
+
+        sw, sp = _props_to_where_params("a", {k: v for k, v in spe.items() if k in node_pk_map.get(exp_src, set())}, nft_s, "sa")
+        dw, dp = _props_to_where_params("b", {k: v for k, v in dpe.items() if k in node_pk_map.get(exp_dst, set())}, nft_d, "da")
+
         rprops = dict(edge.get("props") or {})
         rft = rel_field_types.get(rel, {})
         rpks = rel_pk_map.get(rel, set())
-        
         err = _validate_pks(rprops, rpks, f"关系 `{rel}`", rft)
-        if err: return "", err
-        
-        ri = _props_map_to_cypher_inner({k:v for k,v in rprops.items() if k in rpks}, rft)
-        
+        if err: return "", None, err
+        rw, rp = _props_to_where_params("r", {k: v for k, v in rprops.items() if k in rpks}, rft, "rp")
+
         rlab = _escape_cypher_ident(rel)
         sla = _escape_cypher_ident(exp_src)
         dla = _escape_cypher_ident(exp_dst)
-        
-        if ri:
-            stmts.append(f"MATCH (a:`{sla}` {{{si}}})-[r:`{rlab}` {{{ri}}}]->(b:`{dla}` {{{di}}}) DELETE r")
+
+        where_parts = [p for p in [sw, dw, rw] if p]
+        params = {**sp, **dp, **rp}
+        where_clause = " AND ".join(where_parts)
+        if where_clause:
+            stmt = f"MATCH (a:`{sla}`)-[r:`{rlab}`]->(b:`{dla}`) WHERE {where_clause} DELETE r"
         else:
-            stmts.append(f"MATCH (a:`{sla}` {{{si}}})-[r:`{rlab}`]->(b:`{dla}` {{{di}}}) DELETE r")
+            stmt = f"MATCH (a:`{sla}`)-[r:`{rlab}`]->(b:`{dla}`) DELETE r"
+        return stmt, params if params else None, None
 
     for node in draft_nodes:
         t = str(node["table"])
         props = dict(node.get("props") or {})
         nft = node_field_types.get(t, {})
         pks = node_pk_map.get(t, set())
-        
+
         err = _validate_pks(props, pks, f"节点 `{t}`（{node['id']}）", nft)
-        if err: return "", err
-        
+        if err: return "", None, err
+
         lab = _escape_cypher_ident(t)
         if pks:
-            pk_inner = _props_map_to_cypher_inner({k: v for k, v in props.items() if k in pks}, nft)
-            stmts.append(f"MATCH (n:`{lab}` {{{pk_inner}}}) DETACH DELETE n")
+            pk_where, pk_params = _props_to_where_params("n", {k: v for k, v in props.items() if k in pks}, nft, "w")
+            stmt = f"MATCH (n:`{lab}`) WHERE {pk_where} DETACH DELETE n"
+            return stmt, pk_params, None
 
-    return ";\n".join(stmts) + (";" if stmts else ""), None
+    return "", None, None
 
 
